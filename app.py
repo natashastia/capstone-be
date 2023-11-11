@@ -4,24 +4,34 @@ import os
 from keras.models import load_model
 from keras.preprocessing.image import load_img, img_to_array
 import numpy as np
-from PIL import Image
 from detecto import core, utils
 from flask_cors import CORS
+from base64 import b64encode
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from detecto.visualize import show_labeled_image, plot_prediction_grid
+import keras
+import tensorflow as tf
+from keras.models import Sequential, Model
+import time
+import base64
+
 
 app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": "http://localhost:3000"}, r"/uploads": {"origins": "*"}})
 app.config['UPLOAD_FOLDER'] = 'uploads'
+CORS(app)
 
 try:
     os.mkdir('./uploads')
 except OSError as error:
     pass
 
-# Load the Faster R-CNN model for object detection
-object_detection_model = core.Model.load('model_weights.pth', ['biji kopi', 'kopi gelondong'])
+#Import object detection Model
+model_od = core.Model.load('model_weights.pth', ['Biji Kopi', 'Kopi Gelondong'])
 
-# Load the MobileNet model for classification
-classification_model = load_model('model_mobileNet_100_rlr_v10.h5')
+#Import Classification Model
+model_clf = keras.models.load_model('model_mobileNet_100_rlr_v10.h5')
 
 class_dict = {
     0: 'Bentuk Tidak Wajar',
@@ -29,32 +39,6 @@ class_dict = {
     2: 'Normal',
     3: 'Warna Tidak Wajar'
 }
-
-def detect_objects_and_classify(img_path):
-    # Detect objects using Faster R-CNN
-    image = utils.read_image(img_path)
-    labels, boxes, scores = object_detection_model.predict(image)
-
-    detected_classes = []
-    for label, box, score in zip(labels, boxes, scores):
-        if label == 'biji kopi' or label == 'kopi gelondong':
-            # Konversi nilai-nilai dalam box menjadi bilangan bulat
-            x, y, x1, y1 = [int(val) for val in box]
-            detected_classes.append((label, (x, y, x1, y1), score))
-
-    # Classify the detected objects using MobileNet
-    classifications = []
-    for label, box, score in detected_classes:
-        x, y, x1, y1 = box
-        object_image = Image.open(img_path).crop((x, y, x1, y1))
-        object_image = object_image.resize((224, 224))
-        object_image_array = img_to_array(object_image) # Tidak membagi dengan 255
-        object_image_array = np.expand_dims(object_image_array, 0)
-        predicted_class = np.argmax(classification_model.predict(object_image_array))
-        classification = class_dict[predicted_class]
-        classifications.append(classification)
-
-    return classifications
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -70,18 +54,101 @@ def predict():
         print("File path:", img_path)
         image.save(img_path)
 
-        # Detect objects and classify
-        classifications = detect_objects_and_classify(img_path)
+        reverse_mapping_col = {
+            0: (255, 255, 0),  # Bentuk Tidak Wajar (Kuning)
+            1: (0, 0, 0),      # Kelainan Lain (Hitam)
+            2: (0, 255, 0),    # Normal (Hijau)
+            3: (255, 0, 0),    # Warna Tidak Wajar (Merah)
+        }
 
-        # Mendapatkan URL gambar hasil klasifikasi
-        image_url = 'uploads/' + secure_filename(image.filename)
+        def mapper_col(value):
+            return reverse_mapping_col[value]
 
-        result = {'uploaded_image': image.filename, 'classifications': classifications, 'image_url': image_url}
-        return jsonify(result) # Pastikan respons sesuai dengan format JSON yang diharapkan oleh React
+        reverse_mapping = {
+            0: 'Bentuk Tidak Wajar',
+            1: 'Kelainan Lain',
+            2: 'Normal',
+            3: 'Warna Tidak Wajar'
+        }
 
-@app.route('/uploads/<filename>', methods=['POST'])
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+        def mapper(value):
+            return reverse_mapping[value]
+
+        thresh = 0.5  # Threshold untuk mengontrol sejauh mana hasil deteksi diterima
+
+        # Membaca gambar dari file
+        image_ = utils.read_image(img_path)
+
+        # Melakukan prediksi objek pada gambar menggunakan model objek deteksi (model_od)
+        predictions = model_od.predict(image_)
+        labels, boxes, scores = predictions
+
+        # Mencari indeks dari prediksi yang memiliki skor lebih tinggi dari threshold
+        filtered_indices = np.where(scores > thresh)
+
+        # Mengambil kotak deteksi yang lolos filter
+        filtered_boxes = boxes[filtered_indices]
+
+        # Memproses setiap kotak deteksi yang lolos filter
+        area = filtered_boxes.numpy()
+        result = []
+
+        for a in area:
+            # Mendapatkan koordinat kotak deteksi
+            xmin = np.floor(a[0]).astype(int)
+            ymin = np.floor(a[1]).astype(int)
+            xmax = np.floor(a[2]).astype(int)
+            ymax = np.floor(a[3]).astype(int)
+
+            # Memotong bagian gambar sesuai dengan kotak deteksi
+            crop_img = image_[ymin:ymax, xmin:xmax]
+
+            # Menyimpan potongan gambar ke file sementara (ganti path sesuai kebutuhan)
+            cv2.imwrite("./temp.png", crop_img)
+
+            # Memuat gambar dari file sementara dan menyesuaikannya ke ukuran yang diinginkan
+            img_ = load_img("./temp.png", target_size=(224, 224))
+            image = img_to_array(img_)
+
+            # Memprediksi jenis objek dalam potongan gambar menggunakan model klasifikasi (model_clf)
+            prediction_image = np.array(crop_img)
+            prediction_image = np.expand_dims(image, axis=0)
+            prediction = model_clf.predict(prediction_image)
+
+            # Mendapatkan nilai tertinggi dari prediksi dan indeks kelas yang sesuai
+            score = round(np.max(prediction), 2)
+            value = np.argmax(prediction)
+
+            # Menambahkan hasil prediksi ke dalam daftar hasil
+            result.append(reverse_mapping[value])
+
+            # Membuat label untuk kotak deteksi dengan jenis objek dan skornya
+            label = mapper(value) + "(" + str(score) + ")"
+
+            # Menampilkan label dan kotak deteksi pada gambar
+            #cv2.putText(image_, label, (xmin + 13, ymin + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, mapper_col(value), 2)
+            #cv2.rectangle(image_, (xmin, ymin), (xmax, ymax), mapper_col(value), 3)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1  # Ukuran font yang lebih besar
+            font_thickness = 3  # Ketebalan font yang lebih tebal
+            text_size = cv2.getTextSize(label, font, font_scale, font_thickness)[0]
+            text_x = xmin + 13
+            text_y = ymin + 30
+
+            # Tambahkan label dengan font yang lebih besar dan tebal
+            cv2.putText(image_, label, (text_x, text_y), font, font_scale, mapper_col(value), font_thickness)
+            cv2.rectangle(image_, (xmin, ymin), (xmax, ymax), mapper_col(value), 3)
+
+
+        # Menampilkan gambar asli dengan kotak deteksi dan label
+        timestamp = str(int(time.time()))  # Generate a unique timestamp
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], 'predicted.png')
+        cv2.imwrite(save_path, cv2.cvtColor(image_, cv2.COLOR_RGB2BGR))
+        # Convert the saved image to base64
+        with open(save_path, 'rb') as img_file:
+            base64_image = base64.b64encode(img_file.read()).decode('utf-8')
+        return jsonify({'success': 'Prediction successful', 'image_data': base64_image, 'classifications': result})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
